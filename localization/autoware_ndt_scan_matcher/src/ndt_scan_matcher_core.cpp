@@ -37,7 +37,10 @@
 #endif
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstdlib>
+#include <fstream>
 #include <functional>
 #include <iomanip>
 #include <thread>
@@ -519,7 +522,11 @@ bool NDTScanMatcher::callback_sensor_points_main(
   }
 
   auto output_cloud = std::make_shared<pcl::PointCloud<PointSource>>();
+  const auto align_start = std::chrono::high_resolution_clock::now();
   ndt_ptr_->align(*output_cloud, initial_pose_matrix);
+  const auto align_end = std::chrono::high_resolution_clock::now();
+  const double exe_time_ms =
+    std::chrono::duration<double, std::milli>(align_end - align_start).count();
   const pclomp::NdtResult ndt_result = ndt_ptr_->getResult();
 
   const geometry_msgs::msg::Pose result_pose_msg = matrix4f_to_pose(ndt_result.pose);
@@ -568,6 +575,48 @@ bool NDTScanMatcher::callback_sensor_points_main(
     message << "There is a possibility of oscillation in a local minimum";
     diagnostics_scan_points_->update_level_and_message(
       diagnostic_msgs::msg::DiagnosticStatus::WARN, message.str());
+  }
+
+  // Write JSONL debug output for alignment
+  if (std::getenv("NDT_DEBUG") != nullptr) {
+    const char * debug_file_env = std::getenv("NDT_DEBUG_FILE");
+    const std::string debug_file =
+      debug_file_env ? debug_file_env : "/tmp/ndt_autoware_debug.jsonl";
+
+    // Extract initial and final poses
+    const auto & ip = interpolation_result.interpolated_pose.pose.pose;
+    tf2::Quaternion tf_q_init(ip.orientation.x, ip.orientation.y, ip.orientation.z, ip.orientation.w);
+    tf2::Matrix3x3 m_init(tf_q_init);
+    double init_roll, init_pitch, init_yaw;
+    m_init.getRPY(init_roll, init_pitch, init_yaw);
+
+    tf2::Quaternion tf_q_final(
+      result_pose_msg.orientation.x, result_pose_msg.orientation.y,
+      result_pose_msg.orientation.z, result_pose_msg.orientation.w);
+    tf2::Matrix3x3 m_final(tf_q_final);
+    double final_roll, final_pitch, final_yaw;
+    m_final.getRPY(final_roll, final_pitch, final_yaw);
+
+    bool converged = (ndt_result.iteration_num < ndt_ptr_->getMaximumIterations());
+
+    std::ofstream ofs(debug_file, std::ios::app);
+    if (ofs.is_open()) {
+      ofs << "{\"timestamp_ns\":" << sensor_ros_time.nanoseconds()
+          << ",\"exe_time_ms\":" << std::fixed << std::setprecision(2) << exe_time_ms
+          << ",\"initial_pose\":[" << std::setprecision(6)
+          << ip.position.x << "," << ip.position.y << "," << ip.position.z << ","
+          << init_roll << "," << init_pitch << "," << init_yaw << "]"
+          << ",\"final_pose\":["
+          << result_pose_msg.position.x << "," << result_pose_msg.position.y << "," << result_pose_msg.position.z << ","
+          << final_roll << "," << final_pitch << "," << final_yaw << "]"
+          << ",\"num_source_points\":" << sensor_points_in_baselink_frame->size()
+          << ",\"convergence_status\":\"" << (converged ? "Converged" : "MaxIterations") << "\""
+          << ",\"total_iterations\":" << ndt_result.iteration_num
+          << ",\"final_score\":" << std::setprecision(2) << ndt_result.transform_probability
+          << ",\"final_nvtl\":" << std::setprecision(4) << ndt_result.nearest_voxel_transformation_likelihood
+          << ",\"oscillation_count\":" << oscillation_num
+          << "}\n";
+    }
   }
 
   // check score
@@ -1136,6 +1185,13 @@ void NDTScanMatcher::service_ndt_align_main(
 std::tuple<geometry_msgs::msg::PoseWithCovarianceStamped, double> NDTScanMatcher::align_pose(
   const geometry_msgs::msg::PoseWithCovarianceStamped & initial_pose_with_cov)
 {
+  // Debug timing instrumentation
+  const bool debug_enabled = std::getenv("NDT_DEBUG") != nullptr;
+  const auto total_start = std::chrono::high_resolution_clock::now();
+  std::vector<double> per_particle_times;
+  std::vector<double> best_score_trajectory;
+  double running_best_score = -std::numeric_limits<double>::infinity();
+
   autoware::localization_util::output_pose_with_cov_to_log(
     get_logger(), "align_pose_input", initial_pose_with_cov);
 
@@ -1171,7 +1227,11 @@ std::tuple<geometry_msgs::msg::PoseWithCovarianceStamped, double> NDTScanMatcher
   constexpr int64_t publish_num = 20;
   const int64_t publish_interval = param_.initial_pose_estimation.particles_num / publish_num;
 
+  const int64_t n_startup_trials = param_.initial_pose_estimation.n_startup_trials;
+  (void)n_startup_trials;  // Used in debug output
+
   for (int64_t i = 0; i < param_.initial_pose_estimation.particles_num; i++) {
+    const auto particle_start = std::chrono::high_resolution_clock::now();
     const TreeStructuredParzenEstimator::Input input = tpe.get_next_input();
 
     geometry_msgs::msg::Pose initial_pose;
@@ -1218,7 +1278,41 @@ std::tuple<geometry_msgs::msg::PoseWithCovarianceStamped, double> NDTScanMatcher
       *ndt_ptr_->getInputSource(), *sensor_points_in_map_ptr, ndt_result.pose);
     publish_point_cloud(
       initial_pose_with_cov.header.stamp, param_.frame.map_frame, sensor_points_in_map_ptr);
+
+    // Debug tracking
+    if (debug_enabled) {
+      const auto particle_end = std::chrono::high_resolution_clock::now();
+      const double particle_time_ms =
+        std::chrono::duration<double, std::milli>(particle_end - particle_start).count();
+      per_particle_times.push_back(particle_time_ms);
+      if (particle.score > running_best_score) {
+        running_best_score = particle.score;
+      }
+      best_score_trajectory.push_back(running_best_score);
+    }
   }
+
+  // Compute phase times from per-particle data
+  const double startup_time_ms = [&]() {
+    if (per_particle_times.size() > 0 && n_startup_trials > 0) {
+      double sum = 0.0;
+      for (size_t i = 0; i < std::min(static_cast<size_t>(n_startup_trials), per_particle_times.size()); i++) {
+        sum += per_particle_times[i];
+      }
+      return sum;
+    }
+    return 0.0;
+  }();
+  const double guided_time_ms = [&]() {
+    if (per_particle_times.size() > static_cast<size_t>(n_startup_trials)) {
+      double sum = 0.0;
+      for (size_t i = static_cast<size_t>(n_startup_trials); i < per_particle_times.size(); i++) {
+        sum += per_particle_times[i];
+      }
+      return sum;
+    }
+    return 0.0;
+  }();
 
   auto best_particle_ptr = std::max_element(
     std::begin(particle_array), std::end(particle_array),
@@ -1232,6 +1326,44 @@ std::tuple<geometry_msgs::msg::PoseWithCovarianceStamped, double> NDTScanMatcher
   autoware::localization_util::output_pose_with_cov_to_log(
     get_logger(), "align_pose_output", result_pose_with_cov_msg);
   diagnostics_ndt_align_->add_key_value("best_particle_score", best_particle_ptr->score);
+
+  // Write debug JSONL output
+  if (debug_enabled) {
+    const auto total_end = std::chrono::high_resolution_clock::now();
+    const double total_time_ms =
+      std::chrono::duration<double, std::milli>(total_end - total_start).count();
+    const double nvtl_threshold = 2.3;
+    const bool reliable = best_particle_ptr->score >= nvtl_threshold;
+
+    const char * debug_file_env = std::getenv("NDT_DEBUG_FILE");
+    const std::string debug_file =
+      debug_file_env ? debug_file_env : "/tmp/ndt_autoware_debug.jsonl";
+
+    std::ofstream ofs(debug_file, std::ios::app);
+    if (ofs.is_open()) {
+      // Write JSON manually (avoiding external JSON library dependency)
+      ofs << "{\"type\":\"init\""
+          << ",\"total_time_ms\":" << std::fixed << std::setprecision(2) << total_time_ms
+          << ",\"startup_time_ms\":" << startup_time_ms
+          << ",\"guided_time_ms\":" << guided_time_ms
+          << ",\"num_particles\":" << particle_array.size()
+          << ",\"num_startup\":" << n_startup_trials
+          << ",\"best_score_trajectory\":[";
+      for (size_t i = 0; i < best_score_trajectory.size(); i++) {
+        if (i > 0) ofs << ",";
+        ofs << std::setprecision(4) << best_score_trajectory[i];
+      }
+      ofs << "],\"per_particle_time_ms\":[";
+      for (size_t i = 0; i < per_particle_times.size(); i++) {
+        if (i > 0) ofs << ",";
+        ofs << std::setprecision(2) << per_particle_times[i];
+      }
+      ofs << "],\"final_score\":" << std::setprecision(4) << best_particle_ptr->score
+          << ",\"final_iterations\":" << best_particle_ptr->iteration
+          << ",\"reliable\":" << (reliable ? "true" : "false")
+          << "}\n";
+    }
+  }
 
   return std::make_tuple(result_pose_with_cov_msg, best_particle_ptr->score);
 }
