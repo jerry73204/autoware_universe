@@ -486,6 +486,11 @@ protected:
   std::vector<float> nearest_voxel_transformation_likelihood_array_;
   double nearest_voxel_transformation_likelihood_{};
 
+  /** \brief The total number of voxels found for all source points in the last iteration.
+   * This is the sum of neighborhood sizes across all points.
+   */
+  int total_neighborhood_count_{};
+
   boost::optional<Eigen::Matrix4f> regularization_pose_;
   Eigen::Vector3f regularization_pose_translation_;
 
