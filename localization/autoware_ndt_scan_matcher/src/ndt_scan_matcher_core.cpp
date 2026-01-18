@@ -276,6 +276,17 @@ void NDTScanMatcher::callback_initial_pose_main(
 
   initial_pose_buffer_->push_back(initial_pose_msg_ptr);
 
+  // Debug: log received EKF pose with timestamp (matching CUDA side)
+  if (std::getenv("NDT_DEBUG") != nullptr) {
+    const auto & p = initial_pose_msg_ptr->pose.pose.position;
+    const auto & q = initial_pose_msg_ptr->pose.pose.orientation;
+    const auto & ts = initial_pose_msg_ptr->header.stamp;
+    std::cerr << "[EKF_IN] ts=" << ts.sec << "." << std::setfill('0') << std::setw(9) << ts.nanosec
+              << " pos=(" << std::fixed << std::setprecision(3) << p.x << ", " << p.y << ", " << p.z << ")"
+              << " quat=(" << std::setprecision(6) << q.x << ", " << q.y << ", " << q.z << ", " << q.w << ")"
+              << std::endl;
+  }
+
   {
     // latest_ekf_position_ is also used by callback_timer, so it is necessary to acquire the lock
     std::lock_guard<std::mutex> lock(latest_ekf_position_mtx_);
@@ -444,6 +455,23 @@ bool NDTScanMatcher::callback_sensor_points_main(
   const SmartPoseBuffer::InterpolateResult & interpolation_result =
     interpolation_result_opt.value();
 
+  // Debug: log interpolated pose (matching CUDA side)
+  if (std::getenv("NDT_DEBUG") != nullptr) {
+    const auto & p = interpolation_result.interpolated_pose.pose.pose.position;
+    const auto & q = interpolation_result.interpolated_pose.pose.pose.orientation;
+    const auto & ts = interpolation_result.interpolated_pose.header.stamp;
+    // Convert quaternion to euler angles
+    tf2::Quaternion tf_q(q.x, q.y, q.z, q.w);
+    tf2::Matrix3x3 m(tf_q);
+    double roll, pitch, yaw;
+    m.getRPY(roll, pitch, yaw);
+    std::cerr << "[INTERP] ts=" << ts.sec << "." << std::setfill('0') << std::setw(9) << ts.nanosec
+              << " pos=(" << std::fixed << std::setprecision(3) << p.x << ", " << p.y << ", " << p.z << ")"
+              << " rpy=(" << (roll * 180.0 / M_PI) << ", " << (pitch * 180.0 / M_PI) << ", " << (yaw * 180.0 / M_PI) << ")"
+              << " sensor_ts=" << sensor_ros_time.nanoseconds()
+              << std::endl;
+  }
+
   // if regularization is enabled and available, set pose to NDT for regularization
   if (param_.ndt_regularization_enable) {
     add_regularization_pose(sensor_ros_time);
@@ -475,11 +503,43 @@ bool NDTScanMatcher::callback_sensor_points_main(
   // perform ndt scan matching
   const Eigen::Matrix4f initial_pose_matrix =
     pose_to_matrix4f(interpolation_result.interpolated_pose.pose.pose);
+
+  // Debug: log pose being passed to NDT alignment (matching CUDA side)
+  if (std::getenv("NDT_DEBUG") != nullptr) {
+    const auto & ip = interpolation_result.interpolated_pose.pose.pose;
+    tf2::Quaternion tf_q(ip.orientation.x, ip.orientation.y, ip.orientation.z, ip.orientation.w);
+    tf2::Matrix3x3 m(tf_q);
+    double roll, pitch, yaw;
+    m.getRPY(roll, pitch, yaw);
+    std::cerr << "[NDT_IN] ts_ns=" << sensor_ros_time.nanoseconds()
+              << " pos=(" << std::fixed << std::setprecision(3) << ip.position.x << ", " << ip.position.y << ", " << ip.position.z << ")"
+              << " rpy=(" << (roll * 180.0 / M_PI) << ", " << (pitch * 180.0 / M_PI) << ", " << (yaw * 180.0 / M_PI) << ")"
+              << " n_pts=" << sensor_points_in_baselink_frame->size()
+              << std::endl;
+  }
+
   auto output_cloud = std::make_shared<pcl::PointCloud<PointSource>>();
   ndt_ptr_->align(*output_cloud, initial_pose_matrix);
   const pclomp::NdtResult ndt_result = ndt_ptr_->getResult();
 
   const geometry_msgs::msg::Pose result_pose_msg = matrix4f_to_pose(ndt_result.pose);
+
+  // Debug: log NDT result (matching CUDA side)
+  if (std::getenv("NDT_DEBUG") != nullptr) {
+    tf2::Quaternion tf_q(result_pose_msg.orientation.x, result_pose_msg.orientation.y, result_pose_msg.orientation.z, result_pose_msg.orientation.w);
+    tf2::Matrix3x3 m(tf_q);
+    double roll, pitch, yaw;
+    m.getRPY(roll, pitch, yaw);
+    // Autoware uses is_ok_iteration_num to check convergence, so conv=true means didn't hit max iters
+    bool converged = (ndt_result.iteration_num < ndt_ptr_->getMaximumIterations());
+    std::cerr << "[NDT_OUT] ts_ns=" << sensor_ros_time.nanoseconds()
+              << " pos=(" << std::fixed << std::setprecision(3) << result_pose_msg.position.x << ", " << result_pose_msg.position.y << ", " << result_pose_msg.position.z << ")"
+              << " rpy=(" << (roll * 180.0 / M_PI) << ", " << (pitch * 180.0 / M_PI) << ", " << (yaw * 180.0 / M_PI) << ")"
+              << " iter=" << ndt_result.iteration_num
+              << " conv=" << (converged ? "true" : "false")
+              << " nvtl=" << std::setprecision(3) << ndt_result.nearest_voxel_transformation_likelihood
+              << std::endl;
+  }
   std::vector<geometry_msgs::msg::Pose> transformation_msg_array;
   for (const auto & pose_matrix : ndt_result.transformation_array) {
     geometry_msgs::msg::Pose pose_ros = matrix4f_to_pose(pose_matrix);

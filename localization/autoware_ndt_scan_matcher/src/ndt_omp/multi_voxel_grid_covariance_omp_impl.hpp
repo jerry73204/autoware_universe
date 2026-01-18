@@ -59,6 +59,9 @@
 #include <pcl/common/common.h>
 #include <pcl/filters/boost.h>
 
+#include <cstdlib>
+#include <fstream>
+#include <iomanip>
 #include <limits>
 #include <map>
 #include <string>
@@ -239,6 +242,53 @@ void MultiVoxelGridCovariance<PointT>::createKdtree()
   // Rebuild the kdtree_ of leaves
   if (voxel_centroids_ptr_->size() > 0) {
     kdtree_.setInputCloud(voxel_centroids_ptr_);
+  }
+
+  // Dump voxel data if NDT_DUMP_VOXELS environment variable is set
+  if (const char * dump_env = std::getenv("NDT_DUMP_VOXELS")) {
+    const char * output_path = std::getenv("NDT_DUMP_VOXELS_FILE");
+    std::string filepath =
+      output_path ? std::string(output_path) : "/tmp/ndt_autoware_voxels.json";
+
+    std::ofstream ofs(filepath);
+    if (ofs.is_open()) {
+      ofs << std::setprecision(8);
+      ofs << "{\n";
+      ofs << "  \"resolution\": " << leaf_size_[0] << ",\n";
+      ofs << "  \"num_voxels\": " << leaf_ptrs_.size() << ",\n";
+      ofs << "  \"voxels\": [\n";
+
+      for (size_t i = 0; i < leaf_ptrs_.size(); ++i) {
+        const auto & leaf = *leaf_ptrs_[i];
+        const auto & mean = leaf.mean_;
+        const auto & cov = leaf.cov_;
+        const auto & icov = leaf.icov_;
+
+        ofs << "    {\"mean\": [" << mean[0] << "," << mean[1] << "," << mean[2] << "], ";
+        ofs << "\"cov\": [[" << cov(0, 0) << "," << cov(0, 1) << "," << cov(0, 2) << "],[";
+        ofs << cov(1, 0) << "," << cov(1, 1) << "," << cov(1, 2) << "],[";
+        ofs << cov(2, 0) << "," << cov(2, 1) << "," << cov(2, 2) << "]], ";
+        ofs << "\"inv_cov\": [[" << icov(0, 0) << "," << icov(0, 1) << "," << icov(0, 2) << "],[";
+        ofs << icov(1, 0) << "," << icov(1, 1) << "," << icov(1, 2) << "],[";
+        ofs << icov(2, 0) << "," << icov(2, 1) << "," << icov(2, 2) << "]], ";
+        ofs << "\"point_count\": " << leaf.nr_points_ << ", ";
+        ofs << "\"sample_points\": [";
+        for (size_t j = 0; j < leaf.point_coords_.size(); ++j) {
+          const auto & pt = leaf.point_coords_[j];
+          ofs << "[" << pt[0] << "," << pt[1] << "," << pt[2] << "]";
+          if (j < leaf.point_coords_.size() - 1) ofs << ",";
+        }
+        ofs << "]}";
+        if (i < leaf_ptrs_.size() - 1) ofs << ",";
+        ofs << "\n";
+      }
+
+      ofs << "  ]\n";
+      ofs << "}\n";
+      ofs.close();
+
+      PCL_INFO("[MultiVoxelGridCovariance] Dumped %zu voxels to %s\n", leaf_ptrs_.size(), filepath.c_str());
+    }
   }
 }
 
@@ -426,6 +476,11 @@ void pclomp::MultiVoxelGridCovariance<PointT>::updateLeaf(
   Eigen::Vector4f pt(point.x, point.y, point.z, 0);
   leaf.centroid_.template head<4>() += pt;
   ++leaf.nr_points_;
+
+  // Track first few point coordinates for debugging
+  if (leaf.point_coords_.size() < 5) {
+    leaf.point_coords_.push_back(Eigen::Vector3f(point.x, point.y, point.z));
+  }
 }
 
 template <typename PointT>
