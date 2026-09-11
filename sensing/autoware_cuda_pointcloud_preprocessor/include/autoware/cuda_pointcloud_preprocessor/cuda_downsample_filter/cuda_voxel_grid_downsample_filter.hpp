@@ -96,6 +96,15 @@ public:
   cudaStream_t stream() const { return stream_; }
 
 private:
+  /// Resolve every field the kernels read, and reject an input they cannot read.
+  ///
+  /// The kernels address a field as `data + point_index * point_step + offset`, so
+  /// the order of the fields, their absolute offsets and the size of the point
+  /// struct are all free. What is not free is stated here, and nowhere else.
+  ///
+  /// Throws std::runtime_error naming the first unmet requirement.
+  void resolveInputFields(const cuda_blackboard::CudaPointCloud2 & cloud);
+
   template <typename T>
   T * allocateBufferFromPool(size_t num_elements);
 
@@ -118,6 +127,10 @@ private:
     decltype(OutputPointType::channel) * channel_field_dev);
 
   VoxelInfo voxel_info_{};
+
+  /// PointField datatype of the input's intensity field, as resolved by
+  /// resolveInputFields(). The accumulation kernel is instantiated for it.
+  std::uint8_t input_intensity_datatype_{};
 
   cudaStream_t stream_{};
   cudaMemPool_t mem_pool_{};

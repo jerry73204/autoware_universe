@@ -30,6 +30,8 @@
 #include <cmath>
 #include <memory>
 #include <optional>
+#include <sstream>
+#include <string>
 
 namespace autoware::cuda_pointcloud_preprocessor
 {
@@ -205,44 +207,161 @@ CudaVoxelGridDownsampleFilter::CudaVoxelGridDownsampleFilter(
   thrust_custom_allocator_ = std::make_unique<ThrustCustomAllocator>(stream_, mem_pool_);
 }
 
+namespace
+{
+/// Width in bytes of one element of a PointField datatype, or 0 if the datatype is
+/// not one this filter can read.
+size_t sizeOfPointFieldDatatype(const uint8_t datatype)
+{
+  using sensor_msgs::msg::PointField;
+  switch (datatype) {
+    case PointField::INT8:
+    case PointField::UINT8:
+      return 1;
+    case PointField::INT16:
+    case PointField::UINT16:
+      return 2;
+    case PointField::INT32:
+    case PointField::UINT32:
+    case PointField::FLOAT32:
+      return 4;
+    case PointField::FLOAT64:
+      return 8;
+    default:
+      return 0;
+  }
+}
+
+std::string describeDatatype(const uint8_t datatype)
+{
+  using sensor_msgs::msg::PointField;
+  switch (datatype) {
+    case PointField::INT8:
+      return "INT8";
+    case PointField::UINT8:
+      return "UINT8";
+    case PointField::INT16:
+      return "INT16";
+    case PointField::UINT16:
+      return "UINT16";
+    case PointField::INT32:
+      return "INT32";
+    case PointField::UINT32:
+      return "UINT32";
+    case PointField::FLOAT32:
+      return "FLOAT32";
+    case PointField::FLOAT64:
+      return "FLOAT64";
+    default:
+      return "datatype " + std::to_string(static_cast<int>(datatype));
+  }
+}
+
+const sensor_msgs::msg::PointField * findField(
+  const cuda_blackboard::CudaPointCloud2 & cloud, const std::string & name)
+{
+  for (const auto & field : cloud.fields) {
+    if (field.name == name) {
+      return &field;
+    }
+  }
+  return nullptr;
+}
+
+/// Check the one field `name` against what the kernels do with it, and return its
+/// offset. `required_datatype` is empty when any readable numeric type will do.
+size_t checkField(
+  const cuda_blackboard::CudaPointCloud2 & cloud, const sensor_msgs::msg::PointField & field,
+  const std::optional<uint8_t> required_datatype)
+{
+  const auto fail = [&field](const std::string & reason) {
+    std::stringstream ss;
+    ss << "input pointcloud field '" << field.name << "' " << reason;
+    throw std::runtime_error(ss.str());
+  };
+
+  if (required_datatype && field.datatype != *required_datatype) {
+    fail(
+      "is " + describeDatatype(field.datatype) + ", but this filter reads it as " +
+      describeDatatype(*required_datatype));
+  }
+  const size_t element_size = sizeOfPointFieldDatatype(field.datatype);
+  if (element_size == 0) {
+    fail("has unsupported " + describeDatatype(field.datatype));
+  }
+  if (field.count != 1) {
+    fail("has count " + std::to_string(field.count) + ", but this filter reads a single element");
+  }
+  if (field.offset + element_size > cloud.point_step) {
+    fail(
+      "ends at byte " + std::to_string(field.offset + element_size) + ", past point_step " +
+      std::to_string(cloud.point_step));
+  }
+  return field.offset;
+}
+
+size_t requireField(
+  const cuda_blackboard::CudaPointCloud2 & cloud, const std::string & name,
+  const std::optional<uint8_t> required_datatype)
+{
+  const auto * field = findField(cloud, name);
+  if (field == nullptr) {
+    throw std::runtime_error("input pointcloud has no field named '" + name + "'");
+  }
+  return checkField(cloud, *field, required_datatype);
+}
+
+CudaVoxelGridDownsampleFilter::OptionalField optionalField(
+  const cuda_blackboard::CudaPointCloud2 & cloud, const std::string & name,
+  const uint8_t required_datatype)
+{
+  const auto * field = findField(cloud, name);
+  if (field == nullptr) {
+    return {false, 0};
+  }
+  return {true, checkField(cloud, *field, required_datatype)};
+}
+}  // namespace
+
+void CudaVoxelGridDownsampleFilter::resolveInputFields(
+  const cuda_blackboard::CudaPointCloud2 & cloud)
+{
+  using sensor_msgs::msg::PointField;
+
+  // Every field is addressed as `data + point_index * point_step + offset`, so the
+  // order of the fields in the message, their absolute offsets, and the size of any
+  // particular point struct are all irrelevant here. Comparing the input against a
+  // named layout such as PointXYZI would therefore reject clouds this filter can
+  // process, and accept none it cannot. The requirements are exactly:
+  //
+  //   x, y, z      mandatory, FLOAT32   -- read as float by every kernel
+  //   intensity    mandatory, numeric   -- accumulatePointsKernel is instantiated
+  //                                        for the datatype found here
+  //   return_type  optional, UINT8      -- copied through, not accumulated
+  //   channel      optional, UINT16     -- copied through, not accumulated
+  //
+  // plus count == 1 and offset + width <= point_step for each of them, which is what
+  // makes the pointer arithmetic above stay inside the point.
+  voxel_info_.input_xyzi_offset[0] = requireField(cloud, "x", PointField::FLOAT32);
+  voxel_info_.input_xyzi_offset[1] = requireField(cloud, "y", PointField::FLOAT32);
+  voxel_info_.input_xyzi_offset[2] = requireField(cloud, "z", PointField::FLOAT32);
+  voxel_info_.input_xyzi_offset[3] = requireField(cloud, "intensity", std::nullopt);
+  input_intensity_datatype_ = findField(cloud, "intensity")->datatype;
+
+  // A recognised field this filter cannot read the way it reads it is an error, not
+  // something to drop silently: the output would carry a plausible value that came
+  // from the wrong bytes.
+  voxel_info_.input_return_type_offset = optionalField(cloud, "return_type", PointField::UINT8);
+  voxel_info_.input_channel_offset = optionalField(cloud, "channel", PointField::UINT16);
+}
+
 std::unique_ptr<cuda_blackboard::CudaPointCloud2> CudaVoxelGridDownsampleFilter::filter(
   const cuda_blackboard::CudaPointCloud2::ConstSharedPtr & input_points)
 {
   voxel_info_.num_input_points = input_points->width * input_points->height;
   voxel_info_.input_point_step = input_points->point_step;
 
-  auto get_offset = [&](const std::string & field_name) -> size_t {
-    int index = -1;
-    for (size_t i = 0; i < input_points->fields.size(); ++i) {
-      if (input_points->fields[i].name == field_name) {
-        index = static_cast<int>(i);
-      }
-    }
-    if (index < 0) {
-      std::stringstream ss;
-      ss << "input cloud does not contain filed named '" << field_name << "'";
-      throw std::runtime_error(ss.str());
-    }
-    return input_points->fields[index].offset;
-  };
-
-  voxel_info_.input_xyzi_offset[0] = get_offset("x");
-  voxel_info_.input_xyzi_offset[1] = get_offset("y");
-  voxel_info_.input_xyzi_offset[2] = get_offset("z");
-  voxel_info_.input_xyzi_offset[3] = get_offset("intensity");
-  try {
-    voxel_info_.input_return_type_offset.offset = get_offset("return_type");
-    voxel_info_.input_return_type_offset.is_valid = true;
-  } catch (const std::runtime_error & e) {
-    voxel_info_.input_return_type_offset.is_valid = false;
-  }
-
-  try {
-    voxel_info_.input_channel_offset.offset = get_offset("channel");
-    voxel_info_.input_channel_offset.is_valid = true;
-  } catch (const std::runtime_error & e) {
-    voxel_info_.input_channel_offset.is_valid = false;
-  }
+  resolveInputFields(*input_points);
 
   // Pull working buffer from the pooled region
   auto coord_buffer_dev = allocateBufferFromPool<float>(voxel_info_.num_input_points);
@@ -504,24 +623,9 @@ void CudaVoxelGridDownsampleFilter::getCentroid(
   dim3 block_dim(512);
   dim3 grid_dim_point((voxel_info_.num_input_points + block_dim.x - 1) / block_dim.x);
 
-  // get data type for intensity field
-  auto get_intensity_type = [](const auto & points) -> const uint8_t {
-    std::optional<uint8_t> intensity_index = std::nullopt;
-    for (size_t i = 0; i < points->fields.size(); i++) {
-      // Here assumes input points surely has "intensity" field
-      if (points->fields[i].name == "intensity") {
-        intensity_index = i;
-        break;
-      }
-    }
-    if (!intensity_index) {
-      throw std::runtime_error("intensity field is not found in input");
-    }
-    return points->fields[intensity_index.value()].datatype;
-  };
-
   // calculate voxel index that each input point belong to
-  switch (get_intensity_type(input_points)) {
+  // (the datatype was resolved, and rejected if unsupported, by resolveInputFields)
+  switch (input_intensity_datatype_) {
     case sensor_msgs::msg::PointField::INT8:
       accumulatePointsKernel<int8_t><<<grid_dim_point, block_dim, 0, stream_>>>(
         input_points->data.get(), index_map_dev, point_index_dev, buffer_dev);

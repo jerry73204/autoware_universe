@@ -14,7 +14,8 @@
 
 #include "autoware/cuda_pointcloud_preprocessor/cuda_downsample_filter/cuda_voxel_grid_downsample_filter_node.hpp"
 
-#include "autoware/pointcloud_preprocessor/utility/memory.hpp"
+#include <stdexcept>
+#include <utility>
 
 namespace autoware::cuda_pointcloud_preprocessor
 {
@@ -53,20 +54,18 @@ CudaVoxelGridDownsampleFilterNode::CudaVoxelGridDownsampleFilterNode(
 void CudaVoxelGridDownsampleFilterNode::cudaPointcloudCallback(
   const cuda_blackboard::CudaPointCloud2::ConstSharedPtr msg)
 {
-  // The following only checks compatibility with xyzi
-  // (i.e., just check the first four elements of the point field are x, y, z, and intensity
-  // and don't care the rest of the fields)
-  if (!pointcloud_preprocessor::utils::is_data_layout_compatible_with_point_xyzi(msg->fields)) {
-    // This filter assumes float for intensity data type, though the filter supports
-    // other data types for the intensity field, so here just outputs a WARN message.
-    RCLCPP_WARN(
-      this->get_logger(),
-      "Input pointcloud data layout is not compatible with PointXYZI. "
-      "The output result may not be correct");
+  // The filter states its own requirements on the input layout and throws naming the
+  // first one the cloud does not meet (see
+  // CudaVoxelGridDownsampleFilter::resolveInputFields). Report that and drop the
+  // cloud rather than letting it unwind out of the subscription callback, and
+  // throttle it: a misconfigured upstream node produces one of these per message.
+  try {
+    auto output_pointcloud_ptr = cuda_voxel_grid_downsample_filter_->filter(msg);
+    pub_->publish(std::move(output_pointcloud_ptr));
+  } catch (const std::runtime_error & e) {
+    RCLCPP_ERROR_THROTTLE(
+      this->get_logger(), *this->get_clock(), 5000, "Dropping input pointcloud: %s", e.what());
   }
-
-  auto output_pointcloud_ptr = cuda_voxel_grid_downsample_filter_->filter(msg);
-  pub_->publish(std::move(output_pointcloud_ptr));
 }
 }  // namespace autoware::cuda_pointcloud_preprocessor
 
